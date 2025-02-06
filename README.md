@@ -126,6 +126,18 @@ $ python3 create-param.py testuser param1 paramvalue
 Parameter 'param1' created successfully for client 'testuser'.
 ```
 
+Before start web server, change log server name or put an invalid IP address or it won't start.
+
+Edit this line: SYSLOG_SERVER = os.getenv('SYSLOG_SERVER', 'syslog.example.com') and put any ip address or server name instead syslog.example.com, this project is prepare to run as docker.
+
+After that, run the app and it will show the IP Address of the system:
+
+```bash
+python3 web-vault-api.py
+System IP: 192.168.100.100
+```
+all logs are sent to syslog server to avoid log deletion on intrussions. As I said, I do this with security in mind.
+
 #### Database params:
 
 Now you can validate how param is displayed in database, it will use ~340 characters and with maximum 140 characters aproximately, so if you need more characters for your param, you need to alter database and duplicate chars for evety 140/150 chars (Now I don't remember the exact value but I think it was about 145 of plain text to 344 char in database and it will duplicate even if you use only 1 extra char. If you don't duplicate your field size, the data will be unreadable because it is not possible to reverse the operation with a missing part. That is why validation is so important in this project.
