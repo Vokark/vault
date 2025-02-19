@@ -106,7 +106,6 @@ def set_secure_permissions(base_path):
     """
     if not os.path.exists(base_path):
         logging.error(f"VAULT_API: Error: Cannot change permissions on a non-existent directory {base_path}.")
-        print(f"Error: Cannot change permissions on a non-existent directory {base_path}.")
         return
 
     for root, dirs, files in os.walk(base_path):
@@ -116,8 +115,7 @@ def set_secure_permissions(base_path):
             try:
                 os.chmod(dir_path, 0o770)
             except PermissionError:
-                logging.warning(f"Warning: Directory permissions cannot be changed in dir: {dir_path}")
-                print(f"Warning: Directory permissions cannot be changed in dir: {file_path}")
+                logging.warning(f"VAULT_API: Warning: Directory permissions cannot be changed in dir: {dir_path}")
 
         # Establecer permisos 600 para archivos
         for file in files:
@@ -125,8 +123,7 @@ def set_secure_permissions(base_path):
             try:
                 os.chmod(file_path, 0o660)
             except PermissionError:
-                logging.warning(f"Warning: File permissions cannot be changed for file: {file_path}")
-                print(f"Warning: Warning: File permissions cannot be changed for file {file_path}")
+                logging.warning(f"VAULT_API: Warning: File permissions cannot be changed for file: {file_path}")
 
 # X-Forwarded-For IP address
 def get_client_ip():
@@ -139,6 +136,7 @@ def get_client_ip():
 
 # Close on root execution:
 if os.geteuid() == 0:
+    logging.error("VAULT_API: Error: Running programs as root is dangerous, please, don't do it!!!.")
     print("Error: Running programs as root is dangerous, please, don't do it!!!.")
     sys.exit(1)
 
@@ -881,7 +879,7 @@ def param_add():
         client = cursor.fetchone()
 
         if not client:
-            print(f"Client '{client_name}' not found.")
+            logging.error(f"VAULT_API: Error in /api/param_add Client '{client_name}' not found.")
             return
 
         client_id = client[0]
@@ -915,7 +913,7 @@ def param_add():
         )
         connection.commit()
 
-        print(f"Parameter '{param_name}' created successfully for client '{client_name}'.")
+        logging.info(f"VAULT_API: Parameter '{param_name}' created successfully for client '{client_name}'.")
     finally:
         cursor.close()
         connection.close()
@@ -958,7 +956,7 @@ def param_del():
         client = cursor.fetchone()
 
         if not client:
-            print(f"Client '{client_name}' not found.")
+            logging_info(f"Client '{client_name}' not found.")
             return
 
         client_id = client[0]
@@ -973,7 +971,7 @@ def param_del():
         )
         connection.commit()
 
-        print(f"Parameter '{param_name}' deleted successfully for client '{client_name}'.")
+        logging.info(f"VAULT_API: Parameter '{param_name}' deleted successfully for client '{client_name}'.")
     finally:
         cursor.close()
         connection.close()
