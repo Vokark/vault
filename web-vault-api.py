@@ -21,7 +21,7 @@ from redis import Redis
 from gunicorn.app.base import BaseApplication
 from gunicorn.glogging import Logger
 from flask_limiter import Limiter
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 # Base parameters:
@@ -35,10 +35,15 @@ ssl_template = {
     "O": "Organization",
     "OU": "Organization Unit"
 }
+# Get environment variable with fallback
+def getEnv(key, fallback):
+    if value := os.getenv(key):
+        return value
+    return fallback
 
 # Default Directories, validate if user that run this program have right access to directories. Avoid to use root.
 # Remember to use persistent storage for cert dirs if you use dockers.
-MASTER_CERT_PASSWORD = os.getenv('MASTER_PASSWORD', 'certpass_changeme') # For future use
+MASTER_CERT_PASSWORD = getEnv('MASTER_PASSWORD', 'certpass_changeme') # For future use
 VAULT_BASE_DIR = "/opt/vault"
 CSR_DIR = f"{VAULT_BASE_DIR}/certs/csr/"
 CERTS_PRIVATE_DIR = f"{VAULT_BASE_DIR}/certs/private/"
@@ -47,20 +52,21 @@ SERVER_PRIVATE_DIR = f"{VAULT_BASE_DIR}/certs/server/private/"
 SERVER_PUBLIC_DIR = f"{VAULT_BASE_DIR}/certs/server/public/"
 ROOT_CA_PUBLIC_DIR = f"{VAULT_BASE_DIR}/certs/ca/public/"
 ROOT_CA_PRIVATE_DIR = f"{VAULT_BASE_DIR}/certs/ca/private/"
-VAULT_DOMAIN = ".example.com"
+VAULT_DOMAIN = ".int.csraid.cl"
 VAULT_NAME = "vault"
-BASE_DIR = f"{VAULT_BASE_DIR}/certs" # Clients cert directory.
+BASE_DIR = f"{VAULT_BASE_DIR}/ssl" # Clients cert directory.
 TRUSTED_PROXIES = ["192.168.1.1", "192.168.2.1"] # All Trusted reverse proxies.
-SYSLOG_SERVER = os.getenv('SYSLOG_SERVER', 'syslog.example.com')  # You can use server address or IP, change it or your application won't start.
-SYSLOG_PORT = os.getenv('SYSLOG_PORT', '514')
-LIMITER_CONFIG = "5 per minute" # Limits to 5 requests per minute from same IP address, cam be change at any endpoint manualy.
+SYSLOG_SERVER = getEnv('SYSLOG_SERVER', 'syslog.example.com')  # You can use server address or IP.
+SYSLOG_PORT = getEnv('SYSLOG_PORT', '514')
+LIMITER_CONFIG = "20 per minute" # Limits to 100 requests per minute from same IP address, can be changed at any endpoint manually.
+VAULT_PORT = 10443
 
 # DB parameters
 DB_CONFIG = {
-    'host': os.getenv('DB_HOST', 'localhost'),
-    'user': os.getenv("DB_USER", 'change_user'),
-    'password': os.getenv("DB_PASSWORD", 'changeme'),
-    'database': os.getenv("DB_NAME", 'vault_ddbb')
+    'host': getEnv('DB_HOST', 'localhost'),
+    'user': getEnv("DB_USER", 'change_user'),
+    'password': getEnv("DB_PASSWORD", 'changeme'),
+    'database': getEnv("DB_NAME", 'vault_ddbb')
 }
 
 
@@ -90,6 +96,7 @@ class FlaskGunicornLogger(Logger):
         self.error_log.setLevel(logging.INFO)
         self.access_log.setLevel(logging.INFO)
 
+
 # Change permision for dir
 def set_secure_permissions(base_path):
     """
@@ -98,7 +105,7 @@ def set_secure_permissions(base_path):
     :param base_path: Base path.
     """
     if not os.path.exists(base_path):
-        logging.error(f"Error: Cannot change permissions on a non-existent directory {base_path}.")
+        logging.error(f"VAULT_API: Error: Cannot change permissions on a non-existent directory {base_path}.")
         print(f"Error: Cannot change permissions on a non-existent directory {base_path}.")
         return
 
@@ -107,7 +114,7 @@ def set_secure_permissions(base_path):
         for directory in dirs:
             dir_path = os.path.join(root, directory)
             try:
-                os.chmod(dir_path, 0o700)
+                os.chmod(dir_path, 0o770)
             except PermissionError:
                 logging.warning(f"Warning: Directory permissions cannot be changed in dir: {dir_path}")
                 print(f"Warning: Directory permissions cannot be changed in dir: {file_path}")
@@ -116,7 +123,7 @@ def set_secure_permissions(base_path):
         for file in files:
             file_path = os.path.join(root, file)
             try:
-                os.chmod(file_path, 0o600)
+                os.chmod(file_path, 0o660)
             except PermissionError:
                 logging.warning(f"Warning: File permissions cannot be changed for file: {file_path}")
                 print(f"Warning: Warning: File permissions cannot be changed for file {file_path}")
@@ -127,7 +134,7 @@ def get_client_ip():
     if request.remote_addr in TRUSTED_PROXIES:
         xff = request.headers.getlist("X-Forwarded-For")  # Take first IP fron XFF list (real client)
         if xff and re.match(r"^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$", xff[0]):  # IP Format Validation
-            return xff[0]
+            return xff[0]  # Returning the first IP from XFF list
     return request.remote_addr    # Fallback to normal IP if XFF is not available at header.
 
 # Close on root execution:
@@ -169,7 +176,7 @@ def configure_logging():
     syslog_handler.setFormatter(formatter)
 
     logger.addHandler(syslog_handler)
-    logging.info(f"Logging configured to send logs to a remote syslog server: {SYSLOG_SERVER}:{SYSLOG_PORT}.")
+    logging.info(f"VAULT_API: Logging configured to send logs to a remote syslog server: {SYSLOG_SERVER}:{SYSLOG_PORT}.")
 
 # Flask Configuration
 app = Flask(__name__)
@@ -190,10 +197,13 @@ def create_directory(path):
     os.makedirs(path, exist_ok=True)
 
 # Input security Validation
-def is_valid_input(value, pattern="^[a-zA-Z0-9][a-zA-Z0-9._-]{0,50}$", max_length=50):
+def is_valid_input(value, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,50}$", max_length=50):
     # Validate if value meets the Regular expression criteria and lengt limit,
     # if you need more than 50 characters, use your own regexp pattern
-    return bool(re.match(pattern, value)) and len(value) <= max_length
+    valid = bool(re.match(pattern, value)) and len(value) <= max_length
+    if not valid:
+        logging.warning(f"Invalid input detected: {value} (Pattern: {pattern}, Max Length: {max_length})")
+    return valid
 
 # SSL Functions
 # Function to validate the existence of SSL certificate
@@ -268,7 +278,7 @@ def create_certificate(hostname, ip_address=None, is_server=False, validity_days
         try:
             subprocess.run(openssl_gen_csr_cmd, check=True)
         except subprocess.CalledProcessError as e:
-            logging.error(f"Error generating CSR: {e}")
+            logging.error(f"VAULT_API: Error generating CSR: {e}")
             raise RuntimeError(f"Error generating CSR: {e}")
 
         # Uses root CA to create new certs
@@ -292,7 +302,7 @@ def create_certificate(hostname, ip_address=None, is_server=False, validity_days
         try:
             subprocess.run(" ".join(openssl_sign_cert_cmd), check=True, shell=True, executable="/bin/bash")
         except subprocess.CalledProcessError as e:
-            logging.error(f"Error signing certificate with root CA: {e}")
+            logging.error(f"VAULT_API: Error signing certificate with root CA: {e}")
             raise RuntimeError(f"Error signing certificate with root CA: {e}")
 
     return private_key_path, public_cert_path
@@ -305,8 +315,8 @@ def generate_ssl(client_id):
         backend=default_backend()
     )
 
-    private_key_path = os.path.join(BASE_DIR, f"{client_id}", "private_key.pem")
-    public_key_path = os.path.join(BASE_DIR, f"{client_id}", "public_key.pem")
+    private_key_path = os.path.join(BASE_DIR, f"{client_id}", "private/private_key.pem")
+    public_key_path = os.path.join(BASE_DIR, f"{client_id}", "public/public_key.pem")
 
     # Save private key
     with open(private_key_path, "wb") as f:
@@ -328,7 +338,7 @@ def generate_ssl(client_id):
             )
         )
 
-    logging.info(f"Keys generated for client {client_id} and saved in {os.path.join(BASE_DIR, str(client_id))}")
+    logging.info(f"VAULT_API: Keys generated for client {client_id} and saved in {os.path.join(BASE_DIR, str(client_id))}")
 
 #api_key sha512 hash generation:
 def generateHash(apikey, salt_len=8, iterations=65000):
@@ -373,10 +383,12 @@ def authenticate(api_id, api_key):
             return None
 
         client_id, hashed_api_key, api_level = client
+        cursor.execute("SELECT nom_cli_vch FROM clients WHERE id_cli_int = %s", (client_id,))
+        client_name = cursor.fetchone()
 
         # validate hashedkey
         if hashvalidation(hashed_api_key, api_key):
-            return client_id, api_level
+            return client_id, api_level, client_name[0]
         return None
     finally:
         cursor.close()
@@ -429,11 +441,41 @@ def enforce_https():
     if not request.is_secure:
         return jsonify({"error": "Insecure connection. Use HTTPS."}), 403
 
+
+@app.route('/vault/download_cert', methods=['GET'])
+def download_cert():
+    web_cert_crt_path = os.path.join(SERVER_PUBLIC_DIR, f"{VAULT_NAME}{VAULT_DOMAIN}.crt")
+    # Ruta absoluta o relativa al certificado público en formato PEM
+    if not os.path.exists(web_cert_crt_path):
+        return jsonify({"error": "Certificate not found."}), 404
+    return send_file(
+        web_cert_crt_path,
+        as_attachment=True,
+        download_name='public_certificate.pem',  # nombre sugerido para la descarga
+        mimetype='application/x-pem-file'
+    )
+@app.route('/vault/download_ca_cert', methods=['GET'])
+def download_ca_cert():
+    web_cert_crt_path = os.path.join(ROOT_CA_PUBLIC_DIR, f"{VAULT_NAME}{VAULT_DOMAIN}.crt")
+    # Ruta absoluta o relativa al certificado público en formato PEM
+    if not os.path.exists(web_cert_crt_path):
+        return jsonify({"error": "Certificate not found."}), 404
+    return send_file(
+        web_cert_crt_path,
+        as_attachment=True,
+        download_name='public_ca_certificate.pem',  # nombre sugerido para la descarga
+        mimetype='application/x-pem-file'
+    )
+
+
 # Test Endpoint to validate API operation
-@app.route('/api/test', methods=['GET', 'POST'])
+@app.route('/api/v1/vaulttest', methods=['GET', 'POST'])
 @limiter.limit(LIMITER_CONFIG) 
 def test():
-    return jsonify({"status":"success", "Test": "OK"}), 200
+    if get_client_ip() == "192.168.23.210":
+        return "OK", 200
+    else:
+        return jsonify({"status":"success", "Test": "OK"}), 200
 
 # Endpoint: Delete client
 @app.route('/api/client_del', methods=['POST'])
@@ -441,7 +483,7 @@ def test():
 def client_del():
     data = request.json
     ip_address=get_client_ip()
-    if len(data[0]) != 3:
+    if len(data) != 3:
         logging.warning(f"Warning: Endpoint: /api/client_del, The parameter quantity is incorrect. Source: {ip_address}")
         return jsonify({"error": "The parameter quantity is incorrect."}), 400
     api_id = data.get('api_id')
@@ -451,7 +493,7 @@ def client_del():
         logging.warning(f"Warning: Endpoint: /api/client_del, Invalid parameter input validation. Source: {ip_address}")
         return jsonify({"error": "Invalid input."}), 400
 
-    if not all(map(validate_input, [api_id, api_key, client_name, param_name])):
+    if not all(map(validate_input, [api_id, api_key, client_name])):
         logging.warning(f"Warning: Endpoint: /api/client_del, Invalid Input. Source: {ip_address}")
         return jsonify({"error": "Invalid input."}), 400
 
@@ -460,13 +502,13 @@ def client_del():
         logging.warning(f"Warning: Endpoint: /api/client_del, Invalid authentication for {api_id}. Source: {ip_address}")
         return jsonify({"error": "Auth Error!"}), 403
 
-    client_id, api_level = auth_result
+    client_id, api_level, client_name = auth_result
 
     connection = get_db_connection()
     cursor = connection.cursor()
     try:
         if api_level < 3:
-            logging.error(f"Error: Required level not met when trying to delete client. Endpoint: /api/client_del, Source: {ip_address}")
+            logging.error(f"VAULT_API: Error: Required level not met when trying to delete client. Endpoint: /api/client_del, Source: {ip_address}")
             return jsonify({"error": "Required leve not met."})
         # Retrieve client ID
         cursor.execute("SELECT id_cli_int FROM clients WHERE nom_cli_vch = %s", (client_name,))
@@ -482,40 +524,41 @@ def client_del():
         cursor.execute("DELETE FROM apis WHERE id_cli_int = %s",(del_client_id,))
         cursor.execute("DELETE FROM clients WHERE id_cli_int = %s",(del_client_id,))
         
-        logging.info(f"status: Success, Endpoint: /api/client_del, Client, APIs and Params deleted: {client_name} for: {api_id}, Source: {ip_address}")
+        logging.info(f"VAULT_API: status: Success, Endpoint: /api/client_del, Client, APIs and Params deleted: {client_name} for: {api_id}, Source: {ip_address}")
         return jsonify(({"status": "success", "value": "Params, APIs, Client deleted"}))
     finally:
         cursor.close()
         connection.close()
 
 # Endpoint: Read a parameter
-@app.route('/api/read_param', methods=['POST'])
+@app.route('/api/param_read', methods=['POST'])
 @limiter.limit(LIMITER_CONFIG) 
-def read_param():
+def param_read():
     data = request.json
-    ip_address=get_client_ip()
-    if len(data[0]) != 4:
-        logging.warning(f"Warning: Endpoint: /api/read_params, The parameter quantity is incorrect. Source: {ip_address}")
+    ip_address = get_client_ip()
+    if len(data) != 4:
+        logging.warning(f"Warning: Endpoint: /api/param_read, The parameter quantity is incorrect. Source: {ip_address}")
         return jsonify({"error": "The parameter quantity is incorrect."}), 400
     api_id = data.get('api_id')
     api_key = data.get('api_key')
-    client_name = data.get('client_name')
-    param_name = data.get('param_name')
-    if not is_valid_input(api_id,max_length=17) or not is_valid_input(api_key,max_length=36) or not is_valid_input(client_name,max_length=45) or not is_valid_input(param_name, pattern="^[a-zA-Z0-9][a-zA-Z0-9._-]{0,100}$", max_length=100):
-        logging.warning(f"Warning: Endpoint: /api/read_params, Invalid parameter input validation. Source: {ip_address}")
+    client_name = data.get('client')
+    param_name = data.get('param')
+    if not is_valid_input(api_id,max_length=17) or not is_valid_input(api_key,max_length=36) or not is_valid_input(client_name,max_length=45) or not is_valid_input(param_name, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,100}$", max_length=100):
+        logging.warning(f"Warning: Endpoint: /api/param_read, Invalid parameter input validation. Source: {ip_address}")
         return jsonify({"error": "Invalid input."}), 400
 
     if not all(map(validate_input, [api_id, api_key, client_name, param_name])):
-        logging.warning(f"Warning: Endpoint: /api/read_params, Invalid Input. Source: {ip_address}")
+        logging.warning(f"Warning: Endpoint: /api/param_read, Invalid Input. Source: {ip_address}")
         return jsonify({"error": "Invalid input."}), 400
 
     auth_result = authenticate(api_id, api_key)
     if auth_result is None:
-        logging.warning(f"Warning: Endpoint: /api/read_params, Invalid authentication for {api_id}. Source: {ip_address}")
+        logging.warning(f"Warning: Endpoint: /api/param_read, Invalid authentication for {api_id}. Source: {ip_address}")
         return jsonify({"error": "Auth Error!"}), 403
 
-    client_id, api_level = auth_result
-
+    client_id, api_level, client_name_auth = auth_result
+    if client_name_auth != client_name:
+        return jsonify({"error": "Client Name Error"}), 400
     connection = get_db_connection()
     cursor = connection.cursor()
 
@@ -534,6 +577,7 @@ def read_param():
         cursor.execute("SELECT val_par_vch FROM params WHERE id_cli_int = %s AND nom_par_vch = %s", (client_id, param_name))
         encrypted_param = cursor.fetchone()
 
+
         if not encrypted_param:
             logging.warning(f"Warning: Endpoint: /api/read_params, Invalid parameter: {param_name} for {api_id}. Source: {ip_address}")
             return errorpage(), 404
@@ -541,7 +585,7 @@ def read_param():
         encrypted_value = base64.b64decode(encrypted_param[0])
 
         # Load private key
-        private_key_path = os.path.join(BASE_DIR, str(client_id), "private_key.pem")
+        private_key_path = os.path.join(BASE_DIR, str(client_id), "private/private_key.pem")
         with open(private_key_path, "rb") as f:
             private_key = serialization.load_pem_private_key(f.read(), password=None)
 
@@ -554,8 +598,10 @@ def read_param():
                 label=None
             )
         )
-        logging.info(f"status: Success, Endpoint: /api/read_params, parameter: {param_name} for: {api_id}, Source: {ip_address}")
-        return jsonify(({"status": "success", "parameter":param_name, "value": decrypted_value.decode()}))
+
+
+        logging.info(f"VAULT_API: status: Success, Endpoint: /api/param_read, parameter: {param_name} for: {api_id}, Source: {ip_address}")
+        return jsonify({"status": "success", "param_name": param_name, "param_value": decrypted_value.decode()})
     finally:
         cursor.close()
         connection.close()
@@ -566,7 +612,7 @@ def read_param():
 def count_params():
     data = request.json
     ip_address=get_client_ip()
-    if len(data[0]) != 4:
+    if len(data) != 4:
         logging.warning(f"Warning: Endpoint: /api/count_params, The parameter quantity is incorrect. Source: {ip_address}")
         return jsonify({"error": "The parameter quantity is incorrect."}), 400
     api_id = data.get('api_id')
@@ -586,7 +632,7 @@ def count_params():
         logging.warning(f"Warning: Endpoint: /api/count_params, Invalid authentication. Source: {ip_address}")
         return jsonify({"error": "Error de autenticacion!"}), 403
 
-    client_id, api_level = auth_result
+    client_id, api_level, client_name = auth_result
 
     connection = get_db_connection()
     cursor = connection.cursor()
@@ -607,7 +653,7 @@ def count_params():
         # Count duplicated parameters
         cursor.execute("SELECT COUNT(*) FROM params WHERE id_cli_int = %s AND nom_par_vch = %s", (client_id, param_name))
         count = cursor.fetchone()
-        logging.info(f"status: success, parameter: {param_name}, count: {count}")
+        logging.info(f"VAULT_API: status: success, parameter: {param_name}, count: {count}")
         return jsonify({"status":"success", "parameter": param_name, "count": count}), 200
     finally:
         cursor.close()
@@ -619,7 +665,7 @@ def count_params():
 def regenerate_cert():
     data = request.json
     ip_address = get_client_ip()
-    if len(data[0]) != 3:
+    if len(data) != 3:
         logging.warning(f"Warning: Endpoint: /api/regenerate_cert, The parameter quantity is incorrect. Source: {ip_address}")
         return jsonify({"error": "The parameter quantity is incorrect."}), 400 
     api_id = data.get('api_id')
@@ -638,7 +684,7 @@ def regenerate_cert():
         logging.warning(f"Warning: Endpoint: /api/regenerate_cert, Invalid authentication. Source: {ip_address}")
         return jsonify({"error": "Authentication error"}), 403
 
-    client_id, api_level = auth_result
+    client_id, api_level, client_name = auth_result
 
     if not check_permissions(api_level, 3):
         return jsonify({"error": "Insufficient permissions."}), 403
@@ -652,15 +698,15 @@ def regenerate_cert():
         client = cursor.fetchone()
 
         if not client:
-            logging.error(f"error: Client {client_name} doesn't exist. From source: {ip_address}")
+            logging.error(f"VAULT_API: error: Client {client_name} doesn't exist. From source: {ip_address}")
             return jsonify({"error": "Client doesn't exist."}), 404
 
         client_id = client[0]
         client_dir = os.path.join(BASE_DIR, str(client_id))
 
         # Backup old certificate, if changed again, backup will be lost. Backup is used to change param cypher to new keys.
-        private_key_path = os.path.join(client_dir, "private_key.pem")
-        public_key_path = os.path.join(client_dir, "public_key.pem")
+        private_key_path = os.path.join(client_dir, "private/private_key.pem")
+        public_key_path = os.path.join(client_dir, "public/public_key.pem")
         os.rename(private_key_path, private_key_path + ".bkp")
         os.rename(public_key_path, public_key_path + ".bkp")
 
@@ -700,7 +746,7 @@ def regenerate_cert():
         # Remove old certificate backup
         os.remove(private_key_path + ".bkp")
         os.remove(public_key_path + ".bkp")
-        logging.info(f"status: success, message: Certificate regenerated successfully for client {client_name}. From : {ip_address}")
+        logging.info(f"VAULT_API: status: success, message: Certificate regenerated successfully for client {client_name}. From : {ip_address}")
         return jsonify({"status": "success","message": "Certificate regenerated successfully."}), 200
     finally:
         cursor.close()
@@ -713,7 +759,7 @@ def client_add():
     data = request.json
     ip_address = get_client_ip()
 
-    if len(data[0]) != 4:
+    if len(data) != 4:
         logging.warning(f"Warning: Endpoint: /api/client_add, The parameter quantity is incorrect. Source: {ip_address}")
         return jsonify({"error": "The parameter quantity is incorrect."}), 400
 
@@ -722,7 +768,7 @@ def client_add():
     client_name = data.get('client_name')
     level = data.get('client_level')
 
-    if not is_valid_input(api_id,max_length=17) or not is_valid_input(api_key,max_length=36) or not is_valid_input(client_name,max_length=45) or not is_valid_input(level, pattern="^[0-9]{1,1}$", max_length=1):
+    if not is_valid_input(api_id,max_length=17) or not is_valid_input(api_key,max_length=36) or not is_valid_input(client_name,max_length=45) or not is_valid_input(level, pattern=r"^[0-9]{1,1}$", max_length=1):
         logging.warning(f"Warning: Endpoint: /api/client_add, Invalid parameter input validation. Source: {ip_address}")
         return jsonify({"error": "Invalid input."}), 400
 
@@ -730,9 +776,9 @@ def client_add():
     if auth_result is None:
         logging.warning(f"Warning: Endpoint: /api/client_add, Invalid authentication. Source: {ip_address}")
         return jsonify({"error": "Authentication Error"}), 403
-    client_id, api_level = auth_result
+    client_id, api_level, client_name = auth_result
     if not check_permissions(api_level, 3):
-        return jsonify({"error": "Insuficient permissions."}), 403
+        return jsonify({"error": "Insufficient permissions."}), 403
     # Connect to DB
     connection = get_db_connection()
     cursor = connection.cursor()
@@ -743,7 +789,7 @@ def client_add():
         existing_client = cursor.fetchone()
 
         if existing_client:
-            logging.info(f"Warning: Trying to add invalid client: /api/client_add, Client already used. Client: {client_name}, Source: {ip_address}")
+            logging.info(f"VAULT_API: Warning: Trying to add invalid client: /api/client_add, Client already used. Client: {client_name}, Source: {ip_address}")
             return jsonify({"error": "Client Exists"}), 403
         # Insert client into DB.
         cursor.execute("INSERT INTO clients (nom_cli_vch, lvl_cli_int) VALUES (%s, %s)", (client_name,level,))
@@ -769,12 +815,170 @@ def client_add():
             (api_id, hashedkey, str(client_id))
         )
         connection.commit()
-        logging.info(f"status: success, message: Client added., Client: {client_name}, API_ID: str({api_id})")
+        logging.info(f"VAULT_API: status: success, message: Client added., Client: {client_name}, API_ID: str({api_id})")
         return jsonify({"status": "success","mensaje": "Client added.", "Client": client_name, "API_ID": api_id, "API_KEY": api_key}), 200
     finally:
         cursor.close()
         connection.close()
 
+# Endpoint: Authenticate API
+@app.route('/vault/authenticate', methods=['POST'])
+@limiter.limit(LIMITER_CONFIG)
+def authenticate_api():
+    data = request.json
+    api_id = data.get('api_id')
+    api_key = data.get('api_key')
+    ip_address = get_client_ip()
+    if len(data) != 2:
+        logging.warning(f"Warning: Endpoint: /vault/authenticate, The parameter quantity is incorrect. Source: {ip_address}")
+        return jsonify({"error": "The parameter quantity is incorrect."}), 400
+
+    if not is_valid_input(api_id, max_length=17) or not is_valid_input(api_key, max_length=36):
+        return jsonify({"error": "API ID and API Key are required."}), 400
+
+    client_id, api_level, client_name = authenticate(api_id, api_key)
+    if not client_name:
+        return jsonify({"error": "Authentication failed."}), 403
+    return jsonify({"message": "Authenticated successfully", "client_name": client_name, "api_level": api_level, "client_id": client_id}), 200
+
+
+# Endpoint: Param add 
+@app.route('/api/param_add', methods=['POST'])
+@limiter.limit(LIMITER_CONFIG) 
+def param_add():
+    data = request.json
+    ip_address = get_client_ip()
+
+    if len(data) != 5:
+        logging.warning(f"Warning: Endpoint: /api/param_add, The parameter quantity is incorrect. Source: {ip_address}")
+        return jsonify({"error": "The parameter quantity is incorrect."}), 400
+
+    api_id = data.get('api_id')
+    api_key = data.get('api_key')
+    client_name = data.get('client_name')
+    level = data.get('client_level')
+    param_name = data.get('param_name')
+    param_value = data.get('param_value')
+
+    if not is_valid_input(api_id, max_length=17) or not is_valid_input(api_key, max_length=36) or not is_valid_input(client_name, max_length=45) or not is_valid_input(level, pattern=r"^[0-9]{1,1}$", max_length=1):
+        logging.warning(f"Warning: Endpoint: /api/param_add, Invalid parameter input validation. Source: {ip_address}")
+        return jsonify({"error": "Invalid input."}), 400
+
+    auth_result = authenticate(api_id, api_key)
+    if auth_result is None:
+        logging.warning(f"Warning: Endpoint: /api/param_add, Invalid authentication. Source: {ip_address}")
+        return jsonify({"error": "Authentication Error"}), 403
+    client_id, api_level, client_name = auth_result
+    if not check_permissions(api_level, 3):
+        return jsonify({"error": "Insufficient permissions."}), 403
+    # Connect to DB
+    connection = get_db_connection()
+    cursor = connection.cursor()
+
+    try:
+        # Retrieve client ID
+        cursor.execute("SELECT id_cli_int FROM clients WHERE nom_cli_vch = %s", (client_name,))
+        client = cursor.fetchone()
+
+        if not client:
+            print(f"Client '{client_name}' not found.")
+            return
+
+        client_id = client[0]
+
+        # Load public key
+        public_key_path = os.path.join(BASE_DIR, str(client_id), "public/public_key.pem")
+        with open(public_key_path, "rb") as f:
+            public_key = serialization.load_pem_public_key(f.read())
+
+        # Ensure proper padding and encryption
+        encrypted_param_value = public_key.encrypt(
+            param_value.encode(),
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=SHA256()),
+                algorithm=SHA256(),
+                label=None
+            )
+        )
+
+        # Encode encrypted value in Base64 for storage
+        encrypted_value_b64 = base64.b64encode(encrypted_param_value).decode()
+
+        # Save the parameter in the database
+        cursor.execute(
+            "INSERT INTO params (nom_par_vch, val_par_vch, id_cli_int) VALUES (%s, %s, %s)",
+            (
+                param_name,
+                encrypted_value_b64,
+                client_id
+            )
+        )
+        connection.commit()
+
+        print(f"Parameter '{param_name}' created successfully for client '{client_name}'.")
+    finally:
+        cursor.close()
+        connection.close()
+
+# Endpoint: Param del
+@app.route('/api/param_del', methods=['POST'])
+@limiter.limit(LIMITER_CONFIG) 
+def param_del():
+    data = request.json
+    ip_address = get_client_ip()
+
+    if len(data) != 5:
+        logging.warning(f"Warning: Endpoint: /api/param_del, The parameter quantity is incorrect. Source: {ip_address}")
+        return jsonify({"error": "The parameter quantity is incorrect."}), 400
+
+    api_id = data.get('api_id')
+    api_key = data.get('api_key')
+    client_name = data.get('client_name')
+    level = data.get('client_level')
+    param_name = data.get('param_name')
+
+    if not is_valid_input(api_id, max_length=17) or not is_valid_input(api_key, max_length=36) or not is_valid_input(client_name, max_length=45) or not is_valid_input(level, pattern=r"^[0-9]{1,1}$", max_length=1) or not is_valid_input(param_name, max_length=45):
+        logging.warning(f"Warning: Endpoint: /api/param_del, Invalid parameter input validation. Source: {ip_address}")
+        return jsonify({"error": "Invalid input."}), 400
+
+    auth_result = authenticate(api_id, api_key)
+    if auth_result is None:
+        logging.warning(f"Warning: Endpoint: /api/param_del, Invalid authentication. Source: {ip_address}")
+        return jsonify({"error": "Authentication Error"}), 403
+    client_id, api_level, client_name = auth_result
+    if not check_permissions(api_level, 3):
+        return jsonify({"error": "Insufficient permissions."}), 403
+    # Connect to DB
+    connection = get_db_connection()
+    cursor = connection.cursor()
+
+    try:
+        # Retrieve client ID
+        cursor.execute("SELECT id_cli_int FROM clients WHERE nom_cli_vch = %s", (client_name,))
+        client = cursor.fetchone()
+
+        if not client:
+            print(f"Client '{client_name}' not found.")
+            return
+
+        client_id = client[0]
+
+        # Save the parameter in the database
+        cursor.execute(
+            "DELETE FROM params WHERE nom_par_vch = %s AND id_cli_int = %s",
+            (
+                param_name,
+                client_id
+            )
+        )
+        connection.commit()
+
+        print(f"Parameter '{param_name}' deleted successfully for client '{client_name}'.")
+    finally:
+        cursor.close()
+        connection.close()
+
+ 
 # Security Headers: 
 # X-Frame-Options: Prevent Clickjacking and frames in this site.
 # X-XSS-Protection: protect against Cross Site Scripting attacks.
@@ -800,12 +1004,12 @@ if __name__ == '__main__':
     web_cert_key_path = os.path.join(SERVER_PRIVATE_DIR, f"{VAULT_NAME}{VAULT_DOMAIN}.key")
     web_cert_crt_path = os.path.join(SERVER_PUBLIC_DIR, f"{VAULT_NAME}{VAULT_DOMAIN}.crt")
 
-    print(f"System IP: {local_ip}")
+    print(f"System IP: {local_ip}, port {VAULT_PORT}")
 
    # To Do: Use Nginx as load balancer and reverse proxy adding mod_security for aditional regexp protection and variables validation.
 
     options = {
-        "bind": "0.0.0.0:11443",
+        "bind": f"0.0.0.0:{VAULT_PORT}",
         "workers": "4", # Gunicorn workers, addjust as you need.
         "certfile": web_cert_crt_path,
         "keyfile": web_cert_key_path,
